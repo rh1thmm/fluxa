@@ -45,8 +45,12 @@ type Retry struct {
 
 func Load(path string) (Manifest, error) {
 	var m Manifest
-	if _, err := toml.DecodeFile(path, &m); err != nil {
+	md, err := toml.DecodeFile(path, &m)
+	if err != nil {
 		return m, fmt.Errorf("parse %s: %w", path, err)
+	}
+	if unknown := md.Undecoded(); len(unknown) > 0 {
+		return m, fmt.Errorf("%s: unknown field %q", path, unknown[0].String())
 	}
 	return m, Validate(m, filepath.Dir(path))
 }

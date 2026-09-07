@@ -12,11 +12,12 @@ inspectable logs.
 
 This is the initial v0.1 local-runtime release. It supports local workspaces,
 manifest validation, foreground execution, explicit Lua tasks, HTTP, JSON,
-durable run/task/operation records, and timeline inspection.
+durable run/task/operation records, timeline inspection, and conservative
+execution replay.
 
-Scheduling/daemon deployment, retries and replay recovery, parallel collections,
-and credential backends are intentionally not yet available. HTTP writes whose
-outcome cannot be confirmed are recorded as `ambiguous` and stop the execution.
+Scheduling/daemon deployment, parallel collections, and credential backends are
+intentionally not yet available. HTTP writes whose outcome cannot be confirmed
+are recorded as `ambiguous` and stop the execution until an explicit forced retry.
 
 ## Install
 
@@ -50,6 +51,7 @@ fluxa validate
 fluxa run outreach
 fluxa runs
 fluxa inspect <execution-id>
+fluxa retry <execution-id>
 ```
 
 ## Workflow format
@@ -95,6 +97,7 @@ fluxa workflows
 fluxa run <workflow>
 fluxa runs [workflow]
 fluxa inspect <execution-id>
+fluxa retry <execution-id> [--force]
 fluxa version
 ```
 
@@ -118,6 +121,29 @@ Each workspace stores runtime state under `.fluxa/state.db` using SQLite WAL.
 Do not separate a SQLite WAL database from its `-wal` and `-shm` sidecar files.
 Lua workspaces are trusted local code in this release; Fluxa restricts exposed
 capabilities but does not claim hostile-code sandboxing.
+
+### Replay guarantees and constraints
+
+`fluxa retry` resumes the original execution lineage. It replays Lua code, but
+returns persisted results for confirmed HTTP operations with the same stable task
+identity, ordinal, and canonical request fingerprint. Confirmed side effects are
+not sent again.
+
+Use `key` for dynamic task instances:
+
+```lua
+task("write-email", { key = lead.id }, function() ... end)
+```
+
+Unkeyed tasks use deterministic invocation order and will fail replay if that
+order changes. A retry refuses when workspace source/configuration changes, when
+task identity diverges, or when a request fingerprint changes. An ambiguous
+unsafe HTTP operation requires `fluxa retry <id> --force`; Fluxa does not claim
+exactly-once delivery.
+
+Set `idempotency = true` on generic HTTP requests when an endpoint honors the
+standard `Idempotency-Key` header. Fluxa derives a stable key per operation and
+keeps it stable across attempts.
 
 ## License
 

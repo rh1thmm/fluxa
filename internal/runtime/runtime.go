@@ -1,34 +1,49 @@
+// Package runtime orchestrates durable workflow execution and replay.
 package runtime
 
 import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/fluxa-dev/fluxa/internal/capability/httpcap"
 	"github.com/fluxa-dev/fluxa/internal/config"
 	"github.com/fluxa-dev/fluxa/internal/store"
 	lua "github.com/yuin/gopher-lua"
 )
 
+const APIVersion = 1
+
+type Artifact struct {
+	Version     string          `json:"version"`
+	EntrySHA256 string          `json:"entry_sha256"`
+	Config      json.RawMessage `json:"config"`
+	RuntimeAPI  int             `json:"runtime_api"`
+}
 type Runner struct {
 	Store *store.Store
 	HTTP  *http.Client
 }
+type taskScope struct {
+	id, instanceKey  string
+	operationOrdinal int
+}
 type current struct {
-	executionID string
-	taskID      string
-	ordinal     int
-	ctx         context.Context
-	store       *store.Store
+	executionID, workflowVersion string
+	ctx                          context.Context
+	store                        *store.Store
+	replay, force, ambiguous     bool
+	taskStack                    []taskScope
+	nextByParent                 map[string]int
 }
 
 func New(s *store.Store) *Runner {
@@ -39,16 +54,81 @@ func id(prefix string) string {
 	_, _ = rand.Read(b)
 	return prefix + hex.EncodeToString(b)
 }
-func hash(v string) string { h := sha256.Sum256([]byte(v)); return hex.EncodeToString(h[:]) }
+func digest(v []byte) string { h := sha256.Sum256(v); return hex.EncodeToString(h[:]) }
+func ArtifactFor(root, name string, w config.Workflow) (Artifact, error) {
+	entry := filepath.Join(root, w.Entry)
+	b, err := os.ReadFile(entry)
+	if err != nil {
+		return Artifact{}, err
+	}
+	cfg, _ := json.Marshal(struct {
+		Name     string          `json:"name"`
+		Workflow config.Workflow `json:"workflow"`
+	}{name, w})
+	a := Artifact{EntrySHA256: digest(b), Config: cfg, RuntimeAPI: APIVersion}
+	raw, _ := json.Marshal(a)
+	a.Version = digest(raw)
+	return a, nil
+}
+func Version(entry string) string { b, _ := os.ReadFile(entry); return digest(b) } // compatibility for callers; ArtifactFor is used by the CLI.
+func Compile(entry string) error {
+	L := lua.NewState(lua.Options{SkipOpenLibs: true})
+	defer L.Close()
+	_, err := L.LoadFile(entry)
+	return err
+}
 
-func (r *Runner) Run(ctx context.Context, root string, name string, w config.Workflow, version string, input any) (string, error) {
-	execID := id("exec_")
-	if err := r.Store.CreateExecution(ctx, store.Execution{ID: execID, Workflow: name, Version: version, Status: "running"}, input); err != nil {
+func (r *Runner) Run(ctx context.Context, root, name string, w config.Workflow, artifact Artifact, input any) (string, error) {
+	eid := id("exec_")
+	if err := r.Store.CreateExecution(ctx, store.Execution{ID: eid, Workflow: name, Version: artifact.Version, Status: store.ExecutionRunning}, input, artifact); err != nil {
 		return "", err
 	}
-	_ = r.Store.Event(ctx, execID, "", "", "execution.started", map[string]any{"workflow": name})
+	_ = r.Store.Event(ctx, eid, "", "", "execution.started", map[string]any{"workflow": name, "version": artifact.Version})
+	return eid, r.execute(ctx, root, name, w, artifact, eid, input, false, false, 0)
+}
+func (r *Runner) Retry(ctx context.Context, root string, m config.Manifest, executionID string, force bool) (string, error) {
+	e, err := r.Store.Execution(ctx, executionID)
+	if err != nil {
+		return "", err
+	}
+	if e.Status != store.ExecutionFailed && e.Status != store.ExecutionInterrupted && e.Status != store.ExecutionPausedAmbiguous {
+		return "", fmt.Errorf("execution %s is not retryable (status %s)", executionID, e.Status)
+	}
+	w, ok := m.Workflows[e.Workflow]
+	if !ok {
+		return "", fmt.Errorf("original workflow %q no longer exists", e.Workflow)
+	}
+	artifact, err := ArtifactFor(root, e.Workflow, w)
+	if err != nil {
+		return "", err
+	}
+	if artifact.Version != e.Version {
+		return "", fmt.Errorf("workflow_version_mismatch: execution uses %s but current source is %s", e.Version, artifact.Version)
+	}
+	if e.Status == store.ExecutionPausedAmbiguous && !force {
+		return "", fmt.Errorf("execution has ambiguous operation; retry requires --force")
+	}
+	var input any
+	if len(e.Input) > 0 {
+		if err := json.Unmarshal(e.Input, &input); err != nil {
+			return "", fmt.Errorf("decode original input: %w", err)
+		}
+	}
+	attempt, err := r.Store.BeginRecovery(ctx, executionID, e.Version, force)
+	if err != nil {
+		return "", err
+	}
+	_ = r.Store.Event(ctx, executionID, "", "", "execution.recovery_started", map[string]any{"attempt": attempt, "force": force})
+	err = r.execute(ctx, root, e.Workflow, w, artifact, executionID, input, true, force, attempt)
+	return executionID, err
+}
+
+func (r *Runner) execute(ctx context.Context, root, name string, w config.Workflow, artifact Artifact, eid string, input any, replay, force bool, recoveryAttempt int) error {
 	if w.Timeout != "" {
-		d, _ := time.ParseDuration(w.Timeout)
+		d, err := time.ParseDuration(w.Timeout)
+		if err != nil {
+			return err
+		}
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, d)
 		defer cancel()
@@ -59,80 +139,55 @@ func (r *Runner) Run(ctx context.Context, root string, name string, w config.Wor
 	lua.OpenTable(L)
 	lua.OpenString(L)
 	lua.OpenMath(L)
-	cur := &current{executionID: execID, ctx: ctx, store: r.Store}
-	r.bind(L, cur)
+	c := &current{executionID: eid, workflowVersion: artifact.Version, ctx: ctx, store: r.Store, replay: replay, force: force, nextByParent: map[string]int{}}
+	r.bind(L, c)
 	entry := filepath.Join(root, w.Entry)
 	if err := L.DoFile(entry); err != nil {
-		_ = r.Store.FinishExecution(context.Background(), execID, "failed", err.Error())
-		return execID, err
+		return r.finish(eid, recoveryAttempt, store.ExecutionFailed, err.Error())
 	}
 	fn, ok := L.Get(-1).(*lua.LFunction)
 	L.Pop(1)
 	if !ok {
-		err := fmt.Errorf("workflow %q must return a function", name)
-		_ = r.Store.FinishExecution(context.Background(), execID, "failed", err.Error())
-		return execID, err
+		return r.finish(eid, recoveryAttempt, store.ExecutionFailed, "workflow must return a function")
 	}
-	if err := L.CallByParam(lua.P{Fn: fn, NRet: 1, Protect: true}, r.ctxTable(L, execID)); err != nil {
-		status := "failed"
-		if strings.Contains(err.Error(), "ambiguous") {
-			status = "paused_ambiguous"
+	if err := L.CallByParam(lua.P{Fn: fn, NRet: 1, Protect: true}, r.ctxTable(L, eid, input)); err != nil {
+		status := store.ExecutionFailed
+		if c.ambiguous {
+			status = store.ExecutionPausedAmbiguous
 		}
-		_ = r.Store.Event(context.Background(), execID, "", "", "execution."+status, map[string]any{"error": err.Error()})
-		_ = r.Store.FinishExecution(context.Background(), execID, status, err.Error())
-		return execID, err
+		return r.finish(eid, recoveryAttempt, status, err.Error())
 	}
 	ret := toGo(L.Get(-1))
 	L.Pop(1)
-	_ = r.Store.Event(ctx, execID, "", "", "execution.completed", map[string]any{"result": ret})
-	_ = r.Store.FinishExecution(ctx, execID, "completed", "")
-	return execID, nil
+	_ = r.Store.Event(ctx, eid, "", "", "execution.completed", map[string]any{"result": ret, "replay": replay})
+	return r.finish(eid, recoveryAttempt, store.ExecutionCompleted, "")
 }
+func (r *Runner) finish(eid string, attempt int, status, msg string) error {
+	ctx := context.Background()
+	_ = r.Store.FinishExecution(ctx, eid, status, msg)
+	if attempt > 0 {
+		_ = r.Store.FinishRecovery(ctx, eid, attempt, status, msg)
+	}
+	return errorFor(status, msg)
+}
+func errorFor(status, msg string) error {
+	if status == store.ExecutionCompleted {
+		return nil
+	}
+	return fmt.Errorf("%s: %s", status, msg)
+}
+
 func (r *Runner) bind(L *lua.LState, c *current) {
-	L.SetGlobal("task", L.NewFunction(func(L *lua.LState) int {
-		name := L.CheckString(1)
-		idx := 2
-		var key string
-		if L.GetTop() >= 3 {
-			if t, ok := L.Get(2).(*lua.LTable); ok {
-				key = L.GetField(t, "key").String()
-			}
-			idx = 3
-		}
-		fn := L.CheckFunction(idx)
-		taskID := id("task_")
-		if err := c.store.CreateTask(c.ctx, store.Task{ID: taskID, ExecutionID: c.executionID, Name: name, TaskKey: key, Status: "running", Attempt: 1}); err != nil {
-			L.RaiseError("%s", err.Error())
-			return 0
-		}
-		old := c.taskID
-		c.taskID = taskID
-		c.ordinal = 0
-		_ = c.store.Event(c.ctx, c.executionID, taskID, "", "task.started", map[string]any{"name": name, "key": key})
-		err := L.CallByParam(lua.P{Fn: fn, NRet: 1, Protect: true})
-		if err != nil {
-			c.taskID = old
-			_ = c.store.FinishTask(context.Background(), taskID, "failed", err.Error())
-			_ = c.store.Event(context.Background(), c.executionID, taskID, "", "task.failed", map[string]any{"error": err.Error()})
-			L.RaiseError("%s", err.Error())
-			return 0
-		}
-		ret := L.Get(-1)
-		L.Pop(1)
-		c.taskID = old
-		_ = c.store.FinishTask(c.ctx, taskID, "completed", "")
-		_ = c.store.Event(c.ctx, c.executionID, taskID, "", "task.completed", map[string]any{"result": toGo(ret)})
-		L.Push(ret)
-		return 1
-	}))
+	L.SetGlobal("task", L.NewFunction(func(L *lua.LState) int { return r.taskCall(L, c) }))
 	log := L.NewTable()
 	L.SetField(log, "info", L.NewFunction(func(L *lua.LState) int {
 		msg := L.CheckString(1)
-		data := any(nil)
+		var data any
 		if L.GetTop() > 1 {
 			data = toGo(L.Get(2))
 		}
-		_ = c.store.Event(c.ctx, c.executionID, c.taskID, "", "log.info", map[string]any{"message": msg, "data": data})
+		scope := c.scope()
+		_ = c.store.Event(c.ctx, c.executionID, scope.id, "", "log.info", map[string]any{"message": msg, "data": data})
 		return 0
 	}))
 	L.SetGlobal("log", log)
@@ -146,7 +201,7 @@ func (r *Runner) bind(L *lua.LState, c *current) {
 	L.SetField(j, "decode", L.NewFunction(func(L *lua.LState) int {
 		var v any
 		if err := json.Unmarshal([]byte(L.CheckString(1)), &v); err != nil {
-			L.RaiseError("%s", err.Error())
+			L.RaiseError("%s", err)
 			return 0
 		}
 		L.Push(fromGo(L, v))
@@ -155,7 +210,7 @@ func (r *Runner) bind(L *lua.LState, c *current) {
 	L.SetField(j, "encode", L.NewFunction(func(L *lua.LState) int {
 		b, err := json.Marshal(toGo(L.Get(1)))
 		if err != nil {
-			L.RaiseError("%s", err.Error())
+			L.RaiseError("%s", err)
 			return 0
 		}
 		L.Push(lua.LString(b))
@@ -164,70 +219,229 @@ func (r *Runner) bind(L *lua.LState, c *current) {
 	L.SetGlobal("json", j)
 	L.SetGlobal("env", L.NewTable())
 }
-func (r *Runner) ctxTable(L *lua.LState, id string) *lua.LTable {
+func (c *current) scope() taskScope {
+	if len(c.taskStack) == 0 {
+		return taskScope{}
+	}
+	return c.taskStack[len(c.taskStack)-1]
+}
+func taskIdentity(version, parent, name, key string, ordinal int) (string, string) {
+	mode := "ordinal"
+	token := fmt.Sprintf("ordinal:%d", ordinal)
+	if key != "" {
+		mode = "key"
+		token = "key:" + key
+	}
+	return digest([]byte(strings.Join([]string{"fluxa.task.v1", version, parent, name, token}, "\n"))), mode
+}
+func (r *Runner) taskCall(L *lua.LState, c *current) int {
+	name := L.CheckString(1)
+	idx := 2
+	key := ""
+	if L.GetTop() >= 3 {
+		if t, ok := L.Get(2).(*lua.LTable); ok {
+			if v := L.GetField(t, "key"); v != lua.LNil {
+				key = v.String()
+			}
+		}
+		idx = 3
+	}
+	fn := L.CheckFunction(idx)
+	parent := c.scope().instanceKey
+	ordinal := c.nextByParent[parent]
+	c.nextByParent[parent]++
+	instance, mode := taskIdentity(c.workflowVersion, parent, name, key, ordinal)
+	taskID := id("task_")
+	existing, err := c.store.TaskByInstance(c.ctx, c.executionID, instance)
+	if err == nil {
+		if !c.replay {
+			L.RaiseError("task_identity_conflict: duplicate task instance %s", instance)
+			return 0
+		}
+		if existing.Name != name || existing.TaskKey != key || existing.IdentityMode != mode {
+			L.RaiseError("task_identity_conflict: %s", instance)
+			return 0
+		}
+		taskID = existing.ID
+		if c.replay && existing.Status == store.ExecutionCompleted {
+			var value any
+			if json.Unmarshal(existing.Result, &value) != nil {
+				L.RaiseError("persisted task result is invalid")
+				return 0
+			}
+			_ = c.store.Event(c.ctx, c.executionID, taskID, "", "task.replayed", map[string]any{"instance_key": instance})
+			L.Push(fromGo(L, value))
+			return 1
+		}
+		if c.replay {
+			if err := c.store.RestartTask(c.ctx, taskID); err != nil {
+				L.RaiseError("%s", err)
+				return 0
+			}
+		}
+	} else if err == sql.ErrNoRows {
+		if err := c.store.CreateTask(c.ctx, store.Task{ID: taskID, ExecutionID: c.executionID, InstanceKey: instance, ParentInstanceKey: parent, Name: name, TaskKey: key, InvocationOrdinal: ordinal, IdentityMode: mode, Status: store.ExecutionRunning, Attempt: 1}); err != nil {
+			L.RaiseError("%s", err)
+			return 0
+		}
+	} else {
+		L.RaiseError("%s", err)
+		return 0
+	}
+	c.taskStack = append(c.taskStack, taskScope{id: taskID, instanceKey: instance})
+	_ = c.store.Event(c.ctx, c.executionID, taskID, "", "task.started", map[string]any{"name": name, "instance_key": instance, "replay": c.replay})
+	err = L.CallByParam(lua.P{Fn: fn, NRet: 1, Protect: true})
+	c.taskStack = c.taskStack[:len(c.taskStack)-1]
+	if err != nil {
+		_ = c.store.FinishTask(context.Background(), taskID, store.ExecutionFailed, err.Error(), nil)
+		_ = c.store.Event(context.Background(), c.executionID, taskID, "", "task.failed", map[string]any{"error": err.Error()})
+		L.RaiseError("%s", err)
+		return 0
+	}
+	ret := L.Get(-1)
+	L.Pop(1)
+	result := toGo(ret)
+	_ = c.store.FinishTask(c.ctx, taskID, store.ExecutionCompleted, "", result)
+	_ = c.store.Event(c.ctx, c.executionID, taskID, "", "task.completed", map[string]any{"result": result})
+	L.Push(ret)
+	return 1
+}
+func (r *Runner) ctxTable(L *lua.LState, id string, input any) *lua.LTable {
 	t := L.NewTable()
 	L.SetField(t, "execution_id", lua.LString(id))
+	L.SetField(t, "input", fromGo(L, input))
 	return t
 }
 func (r *Runner) httpCall(L *lua.LState, c *current, method string) int {
-	if c.taskID == "" {
+	scope := c.scope()
+	if scope.id == "" {
 		L.RaiseError("http capability may only be called inside task")
 		return 0
 	}
-	url := L.CheckString(1)
-	var body io.Reader
-	headers := map[string]string{}
-	if L.GetTop() > 1 {
-		if opts, ok := L.Get(2).(*lua.LTable); ok {
-			if v := L.GetField(opts, "body"); v != lua.LNil {
-				body = strings.NewReader(v.String())
-			}
-			if v := L.GetField(opts, "json"); v != lua.LNil {
-				b, _ := json.Marshal(toGo(v))
-				body = strings.NewReader(string(b))
-				headers["Content-Type"] = "application/json"
-			}
-			if ht, ok := L.GetField(opts, "headers").(*lua.LTable); ok {
-				ht.ForEach(func(k, v lua.LValue) { headers[k.String()] = v.String() })
-			}
-		}
-	}
-	c.ordinal++
-	fp := hash(method + "\n" + url + fmt.Sprint(headers))
-	op := store.Operation{ID: id("op_"), TaskID: c.taskID, Ordinal: c.ordinal, Fingerprint: fp, Capability: "http", Attempt: 1}
-	if err := c.store.BeginOperation(c.ctx, op); err != nil {
-		L.RaiseError("%s", err.Error())
+	request, err := requestFromLua(L, method)
+	if err != nil {
+		L.RaiseError("%s", err)
 		return 0
 	}
-	req, err := http.NewRequestWithContext(c.ctx, method, url, body)
+	scope.operationOrdinal++
+	c.taskStack[len(c.taskStack)-1] = scope
+	descriptor, fingerprint, err := httpcap.Canonicalize(request, scope.instanceKey, scope.operationOrdinal)
+	if err != nil {
+		L.RaiseError("%s", err)
+		return 0
+	}
+	descriptorJSON, _ := json.Marshal(descriptor)
+	op, err := c.store.OperationAt(c.ctx, scope.id, scope.operationOrdinal)
 	if err == nil {
-		for k, v := range headers {
-			req.Header.Set(k, v)
+		if op.Fingerprint != fingerprint {
+			L.RaiseError("operation_fingerprint_mismatch at ordinal %d", scope.operationOrdinal)
+			return 0
 		}
-		var resp *http.Response
-		resp, err = r.HTTP.Do(req)
-		if err == nil {
-			defer resp.Body.Close()
-			b, readErr := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-			if readErr != nil {
-				err = readErr
-			} else {
-				result := map[string]any{"status": resp.StatusCode, "body": string(b), "headers": resp.Header}
-				_ = c.store.FinishOperation(c.ctx, op.ID, "completed", result, "")
-				_ = c.store.Event(c.ctx, c.executionID, c.taskID, op.ID, "operation.completed", map[string]any{"status": resp.StatusCode})
-				L.Push(fromGo(L, result))
-				return 1
+		if op.Status == store.OperationCompleted {
+			var v any
+			if json.Unmarshal(op.Result, &v) != nil {
+				L.RaiseError("persisted operation result is invalid")
+				return 0
+			}
+			_ = c.store.Event(c.ctx, c.executionID, scope.id, op.ID, "operation.replayed", map[string]any{"ordinal": scope.operationOrdinal})
+			L.Push(fromGo(L, v))
+			return 1
+		}
+		if op.Status == store.OperationAmbiguous && !c.force {
+			c.ambiguous = true
+			L.RaiseError("ambiguous operation requires --force")
+			return 0
+		}
+		if op.Status == store.OperationRunning && httpUnsafe(method) && !c.force {
+			c.ambiguous = true
+			L.RaiseError("interrupted unsafe operation requires --force")
+			return 0
+		}
+		op.Attempt++
+		if err := c.store.StartOperationAttempt(c.ctx, op.ID, op.Attempt, "replay"); err != nil {
+			L.RaiseError("%s", err)
+			return 0
+		}
+	} else if err == sql.ErrNoRows {
+		key := ""
+		if request.UseIdempotency {
+			key = digest([]byte(c.executionID + "\n" + scope.instanceKey + fmt.Sprintf("\n%d", scope.operationOrdinal)))
+		}
+		op = store.Operation{ID: id("op_"), TaskID: scope.id, Ordinal: scope.operationOrdinal, Fingerprint: fingerprint, Capability: "http", Attempt: 1, Descriptor: descriptorJSON, IdempotencyKey: key}
+		if err := c.store.CreateOperation(c.ctx, op); err != nil {
+			L.RaiseError("%s", err)
+			return 0
+		}
+		if err := c.store.StartOperationAttempt(c.ctx, op.ID, 1, "dispatch"); err != nil {
+			L.RaiseError("%s", err)
+			return 0
+		}
+	} else {
+		L.RaiseError("%s", err)
+		return 0
+	}
+	response, dispatchErr := httpcap.Dispatch(c.ctx, r.HTTP, request, op.IdempotencyKey)
+	if dispatchErr != nil {
+		status := store.OperationFailed
+		if dispatchErr.Ambiguous {
+			status = store.OperationAmbiguous
+			c.ambiguous = true
+		}
+		_ = c.store.FinishOperation(context.Background(), op.ID, status, nil, string(dispatchErr.Kind), dispatchErr.Error())
+		_ = c.store.Event(context.Background(), c.executionID, scope.id, op.ID, "operation."+status, map[string]any{"error": dispatchErr.Error(), "kind": dispatchErr.Kind})
+		L.RaiseError("http %s: %s", status, dispatchErr)
+		return 0
+	}
+	_ = c.store.FinishOperation(c.ctx, op.ID, store.OperationCompleted, response, "", "")
+	_ = c.store.Event(c.ctx, c.executionID, scope.id, op.ID, "operation.completed", map[string]any{"status": response.Status, "ordinal": scope.operationOrdinal})
+	L.Push(fromGo(L, map[string]any{"status": float64(response.Status), "body": response.Body, "headers": headersToMap(response.Headers)}))
+	return 1
+}
+func requestFromLua(L *lua.LState, method string) (httpcap.Request, error) {
+	r := httpcap.Request{Method: method, URL: L.CheckString(1), Headers: map[string]string{}, IdempotencyHeader: "Idempotency-Key"}
+	if L.GetTop() < 2 {
+		return r, nil
+	}
+	opts, ok := L.Get(2).(*lua.LTable)
+	if !ok {
+		return r, fmt.Errorf("http options must be a table")
+	}
+	if v := L.GetField(opts, "body"); v != lua.LNil {
+		r.Body = []byte(v.String())
+	}
+	if v := L.GetField(opts, "json"); v != lua.LNil {
+		b, err := json.Marshal(toGo(v))
+		if err != nil {
+			return r, err
+		}
+		r.Body = b
+		r.Headers["Content-Type"] = "application/json"
+	}
+	if ht, ok := L.GetField(opts, "headers").(*lua.LTable); ok {
+		ht.ForEach(func(k, v lua.LValue) { r.Headers[k.String()] = v.String() })
+	}
+	v := L.GetField(opts, "idempotency")
+	if v != lua.LNil {
+		r.UseIdempotency = true
+		if t, ok := v.(*lua.LTable); ok {
+			if h := L.GetField(t, "header"); h != lua.LNil {
+				r.IdempotencyHeader = h.String()
 			}
 		}
 	}
-	status := "failed"
-	if method != "GET" && method != "HEAD" {
-		status = "ambiguous"
+	return r, nil
+}
+func httpUnsafe(m string) bool { return m != "GET" && m != "HEAD" && m != "OPTIONS" }
+func headersToMap(h http.Header) map[string]any {
+	out := map[string]any{}
+	for k, v := range h {
+		a := make([]any, len(v))
+		for i, x := range v {
+			a[i] = x
+		}
+		out[k] = a
 	}
-	_ = c.store.FinishOperation(context.Background(), op.ID, status, nil, err.Error())
-	_ = c.store.Event(context.Background(), c.executionID, c.taskID, op.ID, "operation."+status, map[string]any{"error": err.Error()})
-	L.RaiseError("http %s: %s", status, err)
-	return 0
+	return out
 }
 func toGo(v lua.LValue) any {
 	switch x := v.(type) {
@@ -286,13 +500,4 @@ func fromGo(L *lua.LState, v any) lua.LValue {
 	default:
 		return lua.LString(fmt.Sprint(v))
 	}
-}
-func Version(entry string) string { b, _ := os.ReadFile(entry); return hash(string(b)) }
-
-// Compile checks Lua syntax without executing workspace code or capabilities.
-func Compile(entry string) error {
-	L := lua.NewState(lua.Options{SkipOpenLibs: true})
-	defer L.Close()
-	_, err := L.LoadFile(entry)
-	return err
 }

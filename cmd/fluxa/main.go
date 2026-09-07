@@ -47,6 +47,8 @@ func run(args []string) error {
 		return workflows()
 	case "run":
 		return runWorkflow(args[1:])
+	case "retry":
+		return retryWorkflow(args[1:])
 	case "runs":
 		return runs(args[1:])
 	case "inspect":
@@ -111,8 +113,34 @@ func runWorkflow(args []string) error {
 		return err
 	}
 	defer s.Close()
+	artifact, err := runtime.ArtifactFor(w.Root, args[0], wf)
+	if err != nil {
+		return err
+	}
 	r := runtime.New(s)
-	eid, err := r.Run(context.Background(), w.Root, args[0], wf, runtime.Version(filepath.Join(w.Root, wf.Entry)), map[string]any{})
+	eid, err := r.Run(context.Background(), w.Root, args[0], wf, artifact, map[string]any{})
+	fmt.Println("execution:", eid)
+	return err
+}
+func retryWorkflow(args []string) error {
+	force := false
+	if len(args) == 2 && args[1] == "--force" {
+		force = true
+		args = args[:1]
+	}
+	if len(args) != 1 {
+		return fmt.Errorf("usage: fluxa retry <execution-id> [--force]")
+	}
+	w, err := ws()
+	if err != nil {
+		return err
+	}
+	s, err := openStore(w)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	eid, err := runtime.New(s).Retry(context.Background(), w.Root, w.Manifest, args[0], force)
 	fmt.Println("execution:", eid)
 	return err
 }
@@ -178,6 +206,7 @@ Usage: fluxa <command>
   validate [workflow]    validate manifest and workflow selection
   workflows              list workflows
   run <workflow>         execute a workflow
+	  retry <execution-id> [--force] resume a failed execution
   runs [workflow]        list executions
   inspect <execution-id> show durable execution events`)
 }
