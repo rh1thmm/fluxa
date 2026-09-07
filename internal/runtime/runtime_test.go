@@ -26,12 +26,12 @@ func TestRunPersistsTaskAndHTTPOperation(t *testing.T) {
 	}))
 	defer server.Close()
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "workflow.lua"), []byte(`return function(ctx)
-  return task("fetch", function()
+	if err := os.WriteFile(filepath.Join(dir, "workflow.lua"), []byte(`local result = task("fetch")
+  :run(function()
     local r = http.get("`+server.URL+`")
     return json.decode(r.body)
   end)
-end`), 0644); err != nil {
+return result`), 0644); err != nil {
 		t.Fatal(err)
 	}
 	s, err := store.Open(filepath.Join(dir, ".fluxa", "state.db"))
@@ -81,14 +81,15 @@ func TestRetryReplaysCompletedOperationAndRetriesLaterSafeFailure(t *testing.T) 
 	}))
 	defer server.Close()
 	dir := t.TempDir()
-	source := `return function(ctx)
-  return task("example", { key = "main" }, function()
+	source := `local result = task("example")
+  :key("main")
+  :run(function()
     local first = http.post("` + server.URL + `/step-a", { json = { value = 1 } })
     local transformed = json.decode(first.body)
     transformed.value = transformed.value + 1
     return http.get("` + server.URL + `/step-b")
   end)
-end`
+return result`
 	if err := os.WriteFile(filepath.Join(dir, "workflow.lua"), []byte(source), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -160,11 +161,11 @@ func TestAmbiguousPOSTRequiresForce(t *testing.T) {
 	}))
 	defer server.Close()
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "workflow.lua"), []byte(`return function(ctx)
-  return task("send", { key = "main" }, function()
+	if err := os.WriteFile(filepath.Join(dir, "workflow.lua"), []byte(`return task("send")
+  :key("main")
+  :run(function()
     return http.post("`+server.URL+`", { json = { value = 1 }, idempotency = true })
-  end)
-end`), 0644); err != nil {
+  end)`), 0644); err != nil {
 		t.Fatal(err)
 	}
 	s, err := store.Open(filepath.Join(dir, ".fluxa", "state.db"))
@@ -196,7 +197,7 @@ end`), 0644); err != nil {
 func TestRetryRejectsChangedWorkflowArtifact(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "workflow.lua")
-	if err := os.WriteFile(path, []byte(`return function(ctx) return task("fail", { key = "main" }, function() error("boom") end) end`), 0644); err != nil {
+	if err := os.WriteFile(path, []byte(`return task("fail"):key("main"):run(function() error("boom") end)`), 0644); err != nil {
 		t.Fatal(err)
 	}
 	s, err := store.Open(filepath.Join(dir, ".fluxa", "state.db"))
@@ -214,7 +215,7 @@ func TestRetryRejectsChangedWorkflowArtifact(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected failure")
 	}
-	if err := os.WriteFile(path, []byte(`-- changed\nreturn function(ctx) return task("fail", { key = "main" }, function() error("boom") end) end`), 0644); err != nil {
+	if err := os.WriteFile(path, []byte(`-- changed\nreturn task("fail"):key("main"):run(function() error("boom") end)`), 0644); err != nil {
 		t.Fatal(err)
 	}
 	_, err = r.Retry(context.Background(), dir, config.Manifest{Workflows: map[string]config.Workflow{"test": w}}, id, false)
@@ -225,10 +226,8 @@ func TestRetryRejectsChangedWorkflowArtifact(t *testing.T) {
 
 func TestDuplicateTaskKeyFails(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "workflow.lua"), []byte(`return function(ctx)
-  task("item", { key = "same" }, function() return 1 end)
-  task("item", { key = "same" }, function() return 2 end)
-end`), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "workflow.lua"), []byte(`task("item"):key("same"):run(function() return 1 end)
+task("item"):key("same"):run(function() return 2 end)`), 0644); err != nil {
 		t.Fatal(err)
 	}
 	s, err := store.Open(filepath.Join(dir, ".fluxa", "state.db"))
@@ -244,5 +243,69 @@ end`), 0644); err != nil {
 	_, err = New(s).Run(context.Background(), dir, "test", w, a, nil)
 	if err == nil || !strings.Contains(err.Error(), "task_identity_conflict") {
 		t.Fatalf("run error = %v", err)
+	}
+}
+
+func TestFluentBuilderRetriesAndRejectsDoubleRun(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "workflow.lua"), []byte(`local attempts = 0
+local value = task("retrying"):retry(1):timeout("1s"):run(function()
+  attempts = attempts + 1
+  if attempts == 1 then error("retry me") end
+  return attempts
+end)
+local b = task("once")
+b:run(function() return value end)
+b:run(function() return value end)`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(filepath.Join(dir, ".fluxa", "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	w := config.Workflow{Entry: "workflow.lua"}
+	a, err := ArtifactFor(dir, "test", w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := New(s).Run(context.Background(), dir, "test", w, a, nil)
+	if err == nil || !strings.Contains(err.Error(), "already executed") {
+		t.Fatalf("run error = %v", err)
+	}
+	tasks, err := s.Tasks(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 2 || tasks[0].Attempt != 2 || tasks[0].Status != store.ExecutionCompleted {
+		t.Fatalf("tasks = %#v", tasks)
+	}
+}
+
+func TestTopLevelWorkflowCanUseFluxaContext(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "workflow.lua"), []byte(`return { workflow = fluxa.workflow, execution = fluxa.execution_id }`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(filepath.Join(dir, ".fluxa", "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	w := config.Workflow{Entry: "workflow.lua"}
+	a, err := ArtifactFor(dir, "example", w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := New(s).Run(context.Background(), dir, "example", w, a, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, err := s.Execution(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(e.Result), `"workflow":"example"`) {
+		t.Fatalf("result = %s", e.Result)
 	}
 }

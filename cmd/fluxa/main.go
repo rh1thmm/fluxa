@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -39,7 +40,7 @@ func run(args []string) error {
 		if err := workspace.Init(args[1]); err != nil {
 			return err
 		}
-		fmt.Println("Initialized Fluxa workspace:", args[1])
+		fmt.Printf("Created Fluxa workspace: %s\n\n  Fluxa.toml\n  workflows/example.lua\n  .gitignore\n\nNext:\n\n  cd %s\n  fluxa run example\n", args[1], args[1])
 		return nil
 	case "validate":
 		return validate(args[1:])
@@ -119,8 +120,31 @@ func runWorkflow(args []string) error {
 	}
 	r := runtime.New(s)
 	eid, err := r.Run(context.Background(), w.Root, args[0], wf, artifact, map[string]any{})
-	fmt.Println("execution:", eid)
-	return err
+	if err != nil {
+		fmt.Println("Execution:", eid)
+		return err
+	}
+	if tasks, taskErr := s.Tasks(context.Background(), eid); taskErr == nil {
+		for _, task := range tasks {
+			if task.Status == store.ExecutionCompleted {
+				fmt.Println("✓", task.Name)
+			}
+		}
+	}
+	e, readErr := s.Execution(context.Background(), eid)
+	if readErr != nil {
+		return readErr
+	}
+	fmt.Println("\nWorkflow completed")
+	fmt.Println("Execution:", eid)
+	if len(e.Result) > 0 {
+		var value any
+		if json.Unmarshal(e.Result, &value) == nil {
+			b, _ := json.Marshal(value)
+			fmt.Println("Result:", string(b))
+		}
+	}
+	return nil
 }
 func retryWorkflow(args []string) error {
 	force := false
@@ -187,15 +211,42 @@ func inspect(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("%s %s %s\n", e.ID, e.Workflow, e.Status)
+	fmt.Println("Execution", e.ID)
+	fmt.Println("Workflow ", e.Workflow)
+	fmt.Println("Status   ", e.Status)
 	if e.Error != "" {
 		fmt.Println("error:", e.Error)
 	}
-	events, err := s.Timeline(context.Background(), e.ID)
+	if len(e.Result) > 0 {
+		fmt.Println("result:", string(e.Result))
+	}
+	tasks, err := s.Tasks(context.Background(), e.ID)
 	if err != nil {
 		return err
 	}
-	fmt.Println(strings.Join(events, "\n"))
+	for _, task := range tasks {
+		mark := "✗"
+		if task.Status == store.ExecutionCompleted {
+			mark = "✓"
+		}
+		fmt.Printf("%s %s\n", mark, task.Name)
+		operations, opErr := s.Operations(context.Background(), task.ID)
+		if opErr != nil {
+			return opErr
+		}
+		for _, operation := range operations {
+			var descriptor struct {
+				Method string `json:"Method"`
+				URL    string `json:"URL"`
+			}
+			_ = json.Unmarshal(operation.Descriptor, &descriptor)
+			operationMark := "✗"
+			if operation.Status == store.OperationCompleted {
+				operationMark = "✓"
+			}
+			fmt.Printf("  %s %s %s %s\n", operationMark, strings.ToUpper(operation.Capability), descriptor.Method, descriptor.URL)
+		}
+	}
 	return nil
 }
 func usage() {

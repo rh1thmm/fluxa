@@ -35,8 +35,8 @@ CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, execution_id TEXT NOT
 	if err := s.db.QueryRowContext(context.Background(), `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 2 {
-		t.Fatalf("schema version = %d, want 2", version)
+	if version != 3 {
+		t.Fatalf("schema version = %d, want 3", version)
 	}
 	if _, err := s.db.Exec(`INSERT INTO executions(id,workflow,version,status,input_json,artifact_manifest_json,recovery_count,started_at) VALUES('e','w','v','failed','{}','{}',0,'2026-01-01T00:00:00Z')`); err != nil {
 		t.Fatalf("new schema unavailable: %v", err)

@@ -42,30 +42,46 @@ func Init(path string) error {
 	if err := os.MkdirAll(filepath.Join(path, "workflows"), 0755); err != nil {
 		return err
 	}
-	for _, d := range []string{"lib", "tests", ".fluxa/artifacts"} {
-		if err := os.MkdirAll(filepath.Join(path, d), 0755); err != nil {
-			return err
-		}
-	}
 	manifest := `[workspace]
 api_version = 1
-default_environment = "development"
 default_timezone = "UTC"
 
-[workflows.outreach]
-entry = "workflows/outreach.lua"
-timeout = "15m"
-secrets = []
+[workflows.example]
+entry = "workflows/example.lua"
+timeout = "30s"
 `
-	script := `return function(ctx)
-  log.info("Fluxa workflow started", { execution_id = ctx.execution_id })
-  return { ok = true }
-end
+	script := `log.info("Starting example workflow", {
+  execution_id = fluxa.execution_id,
+})
+
+local todo_response = task("fetch-todo")
+  :timeout("10s")
+  :run(function()
+    return http.get("https://jsonplaceholder.typicode.com/todos/1")
+  end)
+
+local todo = json.decode(todo_response.body)
+
+local user_response = task("fetch-user")
+  :key(todo.userId)
+  :timeout("10s")
+  :run(function()
+    return http.get("https://jsonplaceholder.typicode.com/users/" .. todo.userId)
+  end)
+
+local user = json.decode(user_response.body)
+
+log.info("Example complete", { todo = todo.title, user = user.name })
+
+return { ok = true, todo = todo.title, user = user.name }
 `
 	if err := writeNew(filepath.Join(path, "Fluxa.toml"), manifest); err != nil {
 		return err
 	}
-	if err := writeNew(filepath.Join(path, "workflows", "outreach.lua"), script); err != nil {
+	if err := writeNew(filepath.Join(path, "workflows", "example.lua"), script); err != nil {
+		return err
+	}
+	if err := writeNew(filepath.Join(path, ".gitignore"), ".fluxa/\n"); err != nil {
 		return err
 	}
 	return register(path)

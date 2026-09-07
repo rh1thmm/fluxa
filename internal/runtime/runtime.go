@@ -37,13 +37,20 @@ type taskScope struct {
 	id, instanceKey  string
 	operationOrdinal int
 }
+type taskBuilder struct {
+	name, key, timeout string
+	retry              int
+	executed           bool
+}
 type current struct {
-	executionID, workflowVersion string
-	ctx                          context.Context
-	store                        *store.Store
-	replay, force, ambiguous     bool
-	taskStack                    []taskScope
-	nextByParent                 map[string]int
+	executionID, workflowVersion, workflowName string
+	input                                      any
+	attempt                                    int
+	ctx                                        context.Context
+	store                                      *store.Store
+	replay, force, ambiguous                   bool
+	taskStack                                  []taskScope
+	nextByParent                               map[string]int
 }
 
 func New(s *store.Store) *Runner {
@@ -139,26 +146,17 @@ func (r *Runner) execute(ctx context.Context, root, name string, w config.Workfl
 	lua.OpenTable(L)
 	lua.OpenString(L)
 	lua.OpenMath(L)
-	c := &current{executionID: eid, workflowVersion: artifact.Version, ctx: ctx, store: r.Store, replay: replay, force: force, nextByParent: map[string]int{}}
+	c := &current{executionID: eid, workflowVersion: artifact.Version, workflowName: name, input: input, attempt: recoveryAttempt + 1, ctx: ctx, store: r.Store, replay: replay, force: force, nextByParent: map[string]int{}}
 	r.bind(L, c)
 	entry := filepath.Join(root, w.Entry)
 	if err := L.DoFile(entry); err != nil {
 		return r.finish(eid, recoveryAttempt, store.ExecutionFailed, err.Error())
 	}
-	fn, ok := L.Get(-1).(*lua.LFunction)
-	L.Pop(1)
-	if !ok {
-		return r.finish(eid, recoveryAttempt, store.ExecutionFailed, "workflow must return a function")
-	}
-	if err := L.CallByParam(lua.P{Fn: fn, NRet: 1, Protect: true}, r.ctxTable(L, eid, input)); err != nil {
-		status := store.ExecutionFailed
-		if c.ambiguous {
-			status = store.ExecutionPausedAmbiguous
-		}
-		return r.finish(eid, recoveryAttempt, status, err.Error())
-	}
 	ret := toGo(L.Get(-1))
 	L.Pop(1)
+	if err := r.Store.SaveExecutionResult(ctx, eid, ret); err != nil {
+		return r.finish(eid, recoveryAttempt, store.ExecutionFailed, err.Error())
+	}
 	_ = r.Store.Event(ctx, eid, "", "", "execution.completed", map[string]any{"result": ret, "replay": replay})
 	return r.finish(eid, recoveryAttempt, store.ExecutionCompleted, "")
 }
@@ -178,6 +176,7 @@ func errorFor(status, msg string) error {
 }
 
 func (r *Runner) bind(L *lua.LState, c *current) {
+	r.bindTaskBuilder(L, c)
 	L.SetGlobal("task", L.NewFunction(func(L *lua.LState) int { return r.taskCall(L, c) }))
 	log := L.NewTable()
 	L.SetField(log, "info", L.NewFunction(func(L *lua.LState) int {
@@ -218,6 +217,81 @@ func (r *Runner) bind(L *lua.LState, c *current) {
 	}))
 	L.SetGlobal("json", j)
 	L.SetGlobal("env", L.NewTable())
+	fluxa := L.NewTable()
+	L.SetField(fluxa, "execution_id", lua.LString(c.executionID))
+	L.SetField(fluxa, "workflow", lua.LString(c.workflowName))
+	L.SetField(fluxa, "attempt", lua.LNumber(c.attempt))
+	L.SetField(fluxa, "input", fromGo(L, c.input))
+	L.SetGlobal("fluxa", fluxa)
+}
+
+const taskBuilderType = "fluxa.task_builder"
+
+func (r *Runner) bindTaskBuilder(L *lua.LState, c *current) {
+	mt := L.NewTypeMetatable(taskBuilderType)
+	methods := L.NewTable()
+	L.SetField(methods, "key", L.NewFunction(func(L *lua.LState) int {
+		b := builderFrom(L)
+		ensureUnexecuted(L, b)
+		v := L.Get(2)
+		if v == lua.LNil {
+			L.RaiseError("task key cannot be nil")
+			return 0
+		}
+		b.key = v.String()
+		L.Push(L.Get(1))
+		return 1
+	}))
+	L.SetField(methods, "retry", L.NewFunction(func(L *lua.LState) int {
+		b := builderFrom(L)
+		ensureUnexecuted(L, b)
+		n := L.CheckInt(2)
+		if n < 0 {
+			L.RaiseError("task retry must be non-negative")
+			return 0
+		}
+		b.retry = n
+		L.Push(L.Get(1))
+		return 1
+	}))
+	L.SetField(methods, "timeout", L.NewFunction(func(L *lua.LState) int {
+		b := builderFrom(L)
+		ensureUnexecuted(L, b)
+		d := L.CheckString(2)
+		if _, err := time.ParseDuration(d); err != nil {
+			L.RaiseError("invalid task timeout %q", d)
+			return 0
+		}
+		b.timeout = d
+		L.Push(L.Get(1))
+		return 1
+	}))
+	L.SetField(methods, "run", L.NewFunction(func(L *lua.LState) int {
+		b := builderFrom(L)
+		ensureUnexecuted(L, b)
+		b.executed = true
+		return r.runTask(L, c, b, L.CheckFunction(2))
+	}))
+	L.SetField(mt, "__index", methods)
+}
+func builderFrom(L *lua.LState) *taskBuilder {
+	ud := L.CheckUserData(1)
+	b, ok := ud.Value.(*taskBuilder)
+	if !ok {
+		L.ArgError(1, "expected Fluxa task builder")
+	}
+	return b
+}
+func ensureUnexecuted(L *lua.LState, b *taskBuilder) {
+	if b.executed {
+		L.RaiseError("task builder %q was already executed", b.name)
+	}
+}
+func (r *Runner) newBuilder(L *lua.LState, name string) *lua.LUserData {
+	ud := L.NewUserData()
+	ud.Value = &taskBuilder{name: name}
+	L.SetMetatable(ud, L.GetTypeMetatable(taskBuilderType))
+	return ud
 }
 func (c *current) scope() taskScope {
 	if len(c.taskStack) == 0 {
@@ -236,17 +310,41 @@ func taskIdentity(version, parent, name, key string, ordinal int) (string, strin
 }
 func (r *Runner) taskCall(L *lua.LState, c *current) int {
 	name := L.CheckString(1)
-	idx := 2
-	key := ""
-	if L.GetTop() >= 3 {
-		if t, ok := L.Get(2).(*lua.LTable); ok {
-			if v := L.GetField(t, "key"); v != lua.LNil {
-				key = v.String()
-			}
-		}
-		idx = 3
+	if L.GetTop() == 1 {
+		L.Push(r.newBuilder(L, name))
+		return 1
 	}
-	fn := L.CheckFunction(idx)
+	b := &taskBuilder{name: name, executed: true}
+	if L.GetTop() == 2 {
+		return r.runTask(L, c, b, L.CheckFunction(2))
+	}
+	options, ok := L.Get(2).(*lua.LTable)
+	if !ok {
+		L.ArgError(2, "expected task options table or function")
+		return 0
+	}
+	if v := L.GetField(options, "key"); v != lua.LNil {
+		b.key = v.String()
+	}
+	if v := L.GetField(options, "retry"); v != lua.LNil {
+		n, ok := v.(lua.LNumber)
+		if !ok || n < 0 || n != lua.LNumber(int(n)) {
+			L.RaiseError("task retry must be a non-negative integer")
+			return 0
+		}
+		b.retry = int(n)
+	}
+	if v := L.GetField(options, "timeout"); v != lua.LNil {
+		b.timeout = v.String()
+		if _, err := time.ParseDuration(b.timeout); err != nil {
+			L.RaiseError("invalid task timeout %q", b.timeout)
+			return 0
+		}
+	}
+	return r.runTask(L, c, b, L.CheckFunction(3))
+}
+func (r *Runner) runTask(L *lua.LState, c *current, b *taskBuilder, fn *lua.LFunction) int {
+	name, key := b.name, b.key
 	parent := c.scope().instanceKey
 	ordinal := c.nextByParent[parent]
 	c.nextByParent[parent]++
@@ -288,23 +386,44 @@ func (r *Runner) taskCall(L *lua.LState, c *current) int {
 		L.RaiseError("%s", err)
 		return 0
 	}
-	c.taskStack = append(c.taskStack, taskScope{id: taskID, instanceKey: instance})
-	_ = c.store.Event(c.ctx, c.executionID, taskID, "", "task.started", map[string]any{"name": name, "instance_key": instance, "replay": c.replay})
-	err = L.CallByParam(lua.P{Fn: fn, NRet: 1, Protect: true})
-	c.taskStack = c.taskStack[:len(c.taskStack)-1]
-	if err != nil {
+	for attempt := 0; ; attempt++ {
+		taskCtx := c.ctx
+		var cancel context.CancelFunc
+		if b.timeout != "" {
+			d, _ := time.ParseDuration(b.timeout)
+			taskCtx, cancel = context.WithTimeout(c.ctx, d)
+		}
+		previousCtx := c.ctx
+		c.ctx = taskCtx
+		c.taskStack = append(c.taskStack, taskScope{id: taskID, instanceKey: instance})
+		_ = c.store.Event(c.ctx, c.executionID, taskID, "", "task.started", map[string]any{"name": name, "instance_key": instance, "replay": c.replay, "attempt": attempt + 1})
+		err = L.CallByParam(lua.P{Fn: fn, NRet: 1, Protect: true})
+		c.taskStack = c.taskStack[:len(c.taskStack)-1]
+		c.ctx = previousCtx
+		if cancel != nil {
+			cancel()
+		}
+		if err == nil {
+			ret := L.Get(-1)
+			L.Pop(1)
+			result := toGo(ret)
+			_ = c.store.FinishTask(c.ctx, taskID, store.ExecutionCompleted, "", result)
+			_ = c.store.Event(c.ctx, c.executionID, taskID, "", "task.completed", map[string]any{"result": result})
+			L.Push(ret)
+			return 1
+		}
 		_ = c.store.FinishTask(context.Background(), taskID, store.ExecutionFailed, err.Error(), nil)
-		_ = c.store.Event(context.Background(), c.executionID, taskID, "", "task.failed", map[string]any{"error": err.Error()})
-		L.RaiseError("%s", err)
-		return 0
+		_ = c.store.Event(context.Background(), c.executionID, taskID, "", "task.failed", map[string]any{"error": err.Error(), "attempt": attempt + 1})
+		if c.ambiguous || attempt >= b.retry {
+			L.RaiseError("%s", err)
+			return 0
+		}
+		if restartErr := c.store.RestartTask(c.ctx, taskID); restartErr != nil {
+			L.RaiseError("%s", restartErr)
+			return 0
+		}
+		_ = c.store.Event(c.ctx, c.executionID, taskID, "", "task.retrying", map[string]any{"next_attempt": attempt + 2})
 	}
-	ret := L.Get(-1)
-	L.Pop(1)
-	result := toGo(ret)
-	_ = c.store.FinishTask(c.ctx, taskID, store.ExecutionCompleted, "", result)
-	_ = c.store.Event(c.ctx, c.executionID, taskID, "", "task.completed", map[string]any{"result": result})
-	L.Push(ret)
-	return 1
 }
 func (r *Runner) ctxTable(L *lua.LState, id string, input any) *lua.LTable {
 	t := L.NewTable()

@@ -29,12 +29,12 @@ const (
 
 type Store struct{ db *sql.DB }
 type Execution struct {
-	ID, Workflow, Version, Status string
-	Input, ArtifactManifest       json.RawMessage
-	RecoveryCount                 int
-	StartedAt                     time.Time
-	EndedAt                       *time.Time
-	Error                         string
+	ID, Workflow, Version, Status   string
+	Input, ArtifactManifest, Result json.RawMessage
+	RecoveryCount                   int
+	StartedAt                       time.Time
+	EndedAt                         *time.Time
+	Error                           string
 }
 type Task struct {
 	ID, ExecutionID, InstanceKey, ParentInstanceKey, Name, TaskKey, IdentityMode, Status string
@@ -101,6 +101,9 @@ var migrations = []migration{
 		`CREATE TABLE IF NOT EXISTS operation_attempts (id INTEGER PRIMARY KEY AUTOINCREMENT, operation_id TEXT NOT NULL REFERENCES operations(id), attempt INTEGER NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL, error_kind TEXT, error TEXT, started_at TEXT NOT NULL, ended_at TEXT, UNIQUE(operation_id, attempt))`,
 		`CREATE TABLE IF NOT EXISTS recovery_attempts (id INTEGER PRIMARY KEY AUTOINCREMENT, execution_id TEXT NOT NULL REFERENCES executions(id), attempt INTEGER NOT NULL, source_version TEXT NOT NULL, force_ambiguous INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, error TEXT, started_at TEXT NOT NULL, ended_at TEXT, UNIQUE(execution_id, attempt))`,
 	}},
+	{3, []string{
+		`ALTER TABLE executions ADD COLUMN result_json BLOB`,
+	}},
 }
 
 func (s *Store) migrate(ctx context.Context) error {
@@ -150,6 +153,10 @@ func (s *Store) CreateExecution(ctx context.Context, e Execution, input, manifes
 }
 func (s *Store) FinishExecution(ctx context.Context, id, status, msg string) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE executions SET status=?, error=?, ended_at=? WHERE id=?`, status, msg, now(), id)
+	return err
+}
+func (s *Store) SaveExecutionResult(ctx context.Context, id string, result any) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE executions SET result_json=? WHERE id=?`, marshal(result), id)
 	return err
 }
 func (s *Store) BeginRecovery(ctx context.Context, executionID, version string, force bool) (int, error) {
@@ -247,10 +254,11 @@ func (s *Store) Execution(ctx context.Context, id string) (Execution, error) {
 	var e Execution
 	var started string
 	var ended sql.NullString
-	var input, manifest []byte
-	err := s.db.QueryRowContext(ctx, `SELECT id,workflow,version,status,input_json,artifact_manifest_json,recovery_count,started_at,ended_at,COALESCE(error,'') FROM executions WHERE id=?`, id).Scan(&e.ID, &e.Workflow, &e.Version, &e.Status, &input, &manifest, &e.RecoveryCount, &started, &ended, &e.Error)
+	var input, manifest, result []byte
+	err := s.db.QueryRowContext(ctx, `SELECT id,workflow,version,status,input_json,artifact_manifest_json,result_json,recovery_count,started_at,ended_at,COALESCE(error,'') FROM executions WHERE id=?`, id).Scan(&e.ID, &e.Workflow, &e.Version, &e.Status, &input, &manifest, &result, &e.RecoveryCount, &started, &ended, &e.Error)
 	e.Input = input
 	e.ArtifactManifest = manifest
+	e.Result = result
 	if err != nil {
 		return e, err
 	}
@@ -262,7 +270,7 @@ func (s *Store) Execution(ctx context.Context, id string) (Execution, error) {
 	return e, nil
 }
 func (s *Store) Runs(ctx context.Context, workflow string) ([]Execution, error) {
-	q := `SELECT id,workflow,version,status,input_json,artifact_manifest_json,recovery_count,started_at,ended_at,COALESCE(error,'') FROM executions`
+	q := `SELECT id,workflow,version,status,input_json,artifact_manifest_json,result_json,recovery_count,started_at,ended_at,COALESCE(error,'') FROM executions`
 	args := []any{}
 	if workflow != "" {
 		q += ` WHERE workflow=?`
@@ -279,7 +287,7 @@ func (s *Store) Runs(ctx context.Context, workflow string) ([]Execution, error) 
 		var e Execution
 		var a string
 		var z sql.NullString
-		if err := rows.Scan(&e.ID, &e.Workflow, &e.Version, &e.Status, &e.Input, &e.ArtifactManifest, &e.RecoveryCount, &a, &z, &e.Error); err != nil {
+		if err := rows.Scan(&e.ID, &e.Workflow, &e.Version, &e.Status, &e.Input, &e.ArtifactManifest, &e.Result, &e.RecoveryCount, &a, &z, &e.Error); err != nil {
 			return nil, err
 		}
 		e.StartedAt, _ = time.Parse(time.RFC3339Nano, a)
@@ -290,6 +298,38 @@ func (s *Store) Runs(ctx context.Context, workflow string) ([]Execution, error) 
 		out = append(out, e)
 	}
 	return out, rows.Err()
+}
+func (s *Store) Tasks(ctx context.Context, executionID string) ([]Task, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id,name,status,attempt FROM tasks WHERE execution_id=? ORDER BY created_at`, executionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var tasks []Task
+	for rows.Next() {
+		var t Task
+		if err := rows.Scan(&t.ID, &t.Name, &t.Status, &t.Attempt); err != nil {
+			return nil, err
+		}
+		tasks = append(tasks, t)
+	}
+	return tasks, rows.Err()
+}
+func (s *Store) Operations(ctx context.Context, taskID string) ([]Operation, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id,capability,status,descriptor_json FROM operations WHERE task_id=? ORDER BY ordinal`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var operations []Operation
+	for rows.Next() {
+		var o Operation
+		if err := rows.Scan(&o.ID, &o.Capability, &o.Status, &o.Descriptor); err != nil {
+			return nil, err
+		}
+		operations = append(operations, o)
+	}
+	return operations, rows.Err()
 }
 func (s *Store) Timeline(ctx context.Context, id string) ([]string, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT created_at,type,COALESCE(data_json,'{}') FROM events WHERE execution_id=? ORDER BY id`, id)

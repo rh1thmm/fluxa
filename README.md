@@ -45,10 +45,10 @@ unregistered projects.
 ## Quick start
 
 ```sh
-fluxa init outreach
-cd outreach
+fluxa init hello-fluxa
+cd hello-fluxa
 fluxa validate
-fluxa run outreach
+fluxa run example
 fluxa runs
 fluxa inspect <execution-id>
 fluxa retry <execution-id>
@@ -61,32 +61,36 @@ fluxa retry <execution-id>
 ```toml
 [workspace]
 api_version = 1
-default_environment = "development"
 default_timezone = "UTC"
 
-[workflows.outreach]
-entry = "workflows/outreach.lua"
-timeout = "15m"
-secrets = []
+[workflows.example]
+entry = "workflows/example.lua"
+timeout = "30s"
 ```
 
-The Lua file returns one entry function. Tasks execute sequentially and are
-durable boundaries; ordinary Lua computation stays ordinary Lua.
+The Lua file itself is the workflow. Its top-level return value is the workflow
+result. Tasks execute sequentially and are durable boundaries; ordinary Lua
+computation stays ordinary Lua.
 
 ```lua
-return function(ctx)
-  local response = task("fetch-leads", { timeout = "10s" }, function()
+log.info("Starting outreach", { execution_id = fluxa.execution_id })
+
+local response = task("fetch-leads")
+  :retry(3)
+  :timeout("10s")
+  :run(function()
     return http.get("https://example.test/leads")
   end)
 
-  local leads = json.decode(response.body)
-  log.info("loaded leads", { count = #leads })
-  return { processed = #leads }
-end
+local leads = json.decode(response.body)
+log.info("loaded leads", { count = #leads })
+
+return { processed = #leads }
 ```
 
-Available v0.1 globals are `task`, `http`, `json`, `log`, `env`, and the entry
-`ctx` table (`ctx.execution_id`). HTTP may be called only inside `task`.
+Available v0.1 globals are `task`, `http`, `json`, `log`, `env`, and `fluxa`.
+`fluxa.execution_id`, `fluxa.workflow`, `fluxa.input`, and `fluxa.attempt` are
+available when needed. HTTP may be called only inside `task`.
 
 ## Commands
 
