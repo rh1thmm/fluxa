@@ -152,7 +152,11 @@ func (r *Runner) execute(ctx context.Context, root, name string, w config.Workfl
 	if err := L.DoFile(entry); err != nil {
 		return r.finish(eid, recoveryAttempt, store.ExecutionFailed, err.Error())
 	}
-	ret := toGo(L.Get(-1))
+	returned := L.Get(-1)
+	if _, isFunction := returned.(*lua.LFunction); isFunction {
+		return r.finish(eid, recoveryAttempt, store.ExecutionFailed, "workflow returned a function; execute workflow code at top level instead")
+	}
+	ret := toGo(returned)
 	L.Pop(1)
 	if err := r.Store.SaveExecutionResult(ctx, eid, ret); err != nil {
 		return r.finish(eid, recoveryAttempt, store.ExecutionFailed, err.Error())

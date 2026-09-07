@@ -309,3 +309,24 @@ func TestTopLevelWorkflowCanUseFluxaContext(t *testing.T) {
 		t.Fatalf("result = %s", e.Result)
 	}
 }
+
+func TestWorkflowFunctionWrapperIsRejected(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "workflow.lua"), []byte(`return function() return { ok = true } end`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(filepath.Join(dir, ".fluxa", "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	w := config.Workflow{Entry: "workflow.lua"}
+	a, err := ArtifactFor(dir, "example", w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = New(s).Run(context.Background(), dir, "example", w, a, nil)
+	if err == nil || !strings.Contains(err.Error(), "execute workflow code at top level") {
+		t.Fatalf("run error = %v", err)
+	}
+}
