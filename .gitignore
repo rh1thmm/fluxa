@@ -1,0 +1,6 @@
+bin/
+dist/
+.fluxa/
+*.db
+*.db-shm
+*.db-wal
