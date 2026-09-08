@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/robfig/cron/v3"
 )
 
 const APIVersion = 1
@@ -24,15 +25,24 @@ type Workspace struct {
 }
 
 type Workflow struct {
-	Entry     string   `toml:"entry"`
-	Timeout   string   `toml:"timeout"`
-	Secrets   []string `toml:"secrets"`
-	OnFailure string   `toml:"on_failure"`
-	Schedule  Schedule `toml:"schedule"`
-	Defaults  Defaults `toml:"defaults"`
+	Entry          string   `toml:"entry"`
+	Timeout        string   `toml:"timeout"`
+	Secrets        []string `toml:"secrets"`
+	OnFailure      string   `toml:"on_failure"`
+	MaxConcurrency int      `toml:"max_concurrency"`
+	Schedule       Schedule `toml:"schedule"`
+	Webhook        Webhook  `toml:"webhook"`
+	Defaults       Defaults `toml:"defaults"`
 }
 
-type Schedule struct{ Cron, Timezone string }
+type Schedule struct {
+	Cron     string `toml:"cron"`
+	Timezone string `toml:"timezone"`
+}
+type Webhook struct {
+	Method string `toml:"method"`
+	Path   string `toml:"path"`
+}
 type Defaults struct {
 	Retry Retry `toml:"retry"`
 }
@@ -62,6 +72,7 @@ func Validate(m Manifest, root string) error {
 	if len(m.Workflows) == 0 {
 		return fmt.Errorf("at least one workflow is required")
 	}
+	webhookRoutes := make(map[string]string)
 	for name, w := range m.Workflows {
 		if name == "" || w.Entry == "" {
 			return fmt.Errorf("workflow %q must define entry", name)
@@ -77,6 +88,9 @@ func Validate(m Manifest, root string) error {
 				return fmt.Errorf("workflow %q timeout: %w", name, err)
 			}
 		}
+		if w.MaxConcurrency < 0 {
+			return fmt.Errorf("workflow %q max_concurrency must be non-negative", name)
+		}
 		if w.OnFailure != "" {
 			if _, ok := m.Workflows[w.OnFailure]; !ok {
 				return fmt.Errorf("workflow %q references unknown on_failure workflow %q", name, w.OnFailure)
@@ -86,6 +100,24 @@ func Validate(m Manifest, root string) error {
 			if _, err := time.LoadLocation(w.Schedule.Timezone); err != nil {
 				return fmt.Errorf("workflow %q schedule timezone: %w", name, err)
 			}
+		}
+		if w.Schedule.Cron != "" {
+			if _, err := cron.ParseStandard(w.Schedule.Cron); err != nil {
+				return fmt.Errorf("workflow %q schedule cron: %w", name, err)
+			}
+		}
+		if w.Webhook.Path != "" {
+			if !strings.HasPrefix(w.Webhook.Path, "/") {
+				return fmt.Errorf("workflow %q webhook path must start with /", name)
+			}
+			if w.Webhook.Method == "" {
+				return fmt.Errorf("workflow %q webhook method is required", name)
+			}
+			route := strings.ToUpper(w.Webhook.Method) + " " + w.Webhook.Path
+			if other, exists := webhookRoutes[route]; exists {
+				return fmt.Errorf("workflows %q and %q declare the same webhook %s", other, name, route)
+			}
+			webhookRoutes[route] = name
 		}
 	}
 	return nil

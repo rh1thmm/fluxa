@@ -18,6 +18,8 @@ const (
 	ExecutionCompleted       = "completed"
 	ExecutionFailed          = "failed"
 	ExecutionInterrupted     = "interrupted"
+	ExecutionWaiting         = "waiting"
+	ExecutionQueued          = "queued"
 	ExecutionPausedAmbiguous = "paused_ambiguous"
 	OperationPending         = "pending"
 	OperationRunning         = "running"
@@ -48,6 +50,16 @@ type Operation struct {
 	Ordinal, Attempt                                            int
 	Descriptor, Result                                          json.RawMessage
 	Error                                                       string
+}
+type Wait struct {
+	ExecutionID string
+	Ordinal     int
+	Until       time.Time
+	Status      string
+}
+type QueuedExecution struct {
+	ExecutionID, Workflow string
+	Attempt               int
 }
 
 func Open(path string) (*Store, error) {
@@ -104,6 +116,19 @@ var migrations = []migration{
 	{3, []string{
 		`ALTER TABLE executions ADD COLUMN result_json BLOB`,
 	}},
+	{4, []string{
+		`CREATE TABLE IF NOT EXISTS workflow_activation (workflow TEXT PRIMARY KEY, active INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS schedule_state (workflow TEXT PRIMARY KEY, next_run_at TEXT, updated_at TEXT NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS schedule_runs (workflow TEXT NOT NULL, scheduled_at TEXT NOT NULL, execution_id TEXT, created_at TEXT NOT NULL, PRIMARY KEY(workflow, scheduled_at))`,
+	}},
+	{5, []string{
+		`CREATE TABLE IF NOT EXISTS execution_waits (execution_id TEXT NOT NULL REFERENCES executions(id), ordinal INTEGER NOT NULL, until_at TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, completed_at TEXT, PRIMARY KEY(execution_id, ordinal))`,
+		`CREATE INDEX IF NOT EXISTS execution_waits_due ON execution_waits(status, until_at)`,
+	}},
+	{6, []string{
+		`CREATE TABLE IF NOT EXISTS execution_queue (execution_id TEXT PRIMARY KEY REFERENCES executions(id), workflow TEXT NOT NULL, status TEXT NOT NULL, attempt INTEGER NOT NULL DEFAULT 0, available_at TEXT NOT NULL, claimed_at TEXT, finished_at TEXT, created_at TEXT NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS execution_queue_ready ON execution_queue(status, available_at, created_at)`,
+	}},
 }
 
 func (s *Store) migrate(ctx context.Context) error {
@@ -151,6 +176,88 @@ func (s *Store) CreateExecution(ctx context.Context, e Execution, input, manifes
 	_, err := s.db.ExecContext(ctx, `INSERT INTO executions(id,workflow,version,status,input_json,artifact_manifest_json,started_at) VALUES(?,?,?,?,?,?,?)`, e.ID, e.Workflow, e.Version, e.Status, marshal(input), marshal(manifest), now())
 	return err
 }
+
+// EnqueueExecution durably creates both the execution ledger row and its local
+// dispatch record. A daemon crash cannot leave one without the other.
+func (s *Store) EnqueueExecution(ctx context.Context, e Execution, input, manifest any) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO executions(id,workflow,version,status,input_json,artifact_manifest_json,started_at) VALUES(?,?,?,?,?,?,?)`, e.ID, e.Workflow, e.Version, ExecutionQueued, marshal(input), marshal(manifest), now()); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO execution_queue(execution_id,workflow,status,available_at,created_at) VALUES(?,?,?,?,?)`, e.ID, e.Workflow, ExecutionQueued, now(), now()); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO events(execution_id,type,data_json,created_at) VALUES(?,?,?,?)`, e.ID, "execution.queued", marshal(map[string]any{"workflow": e.Workflow, "version": e.Version}), now()); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+func (s *Store) RecoverQueue(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE execution_queue SET status=?,claimed_at=NULL WHERE status=?`, ExecutionQueued, ExecutionRunning); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE executions SET status=? WHERE id IN (SELECT execution_id FROM execution_queue WHERE status=?) AND status=?`, ExecutionQueued, ExecutionQueued, ExecutionRunning); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+func (s *Store) ClaimQueuedExecution(ctx context.Context) (QueuedExecution, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return QueuedExecution{}, err
+	}
+	var q QueuedExecution
+	err = tx.QueryRowContext(ctx, `SELECT execution_id,workflow,attempt FROM execution_queue WHERE status=? AND available_at<=? ORDER BY created_at LIMIT 1`, ExecutionQueued, now()).Scan(&q.ExecutionID, &q.Workflow, &q.Attempt)
+	if err == sql.ErrNoRows {
+		_ = tx.Rollback()
+		return q, err
+	}
+	if err != nil {
+		_ = tx.Rollback()
+		return q, err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE execution_queue SET status=?,attempt=attempt+1,claimed_at=? WHERE execution_id=? AND status=?`, ExecutionRunning, now(), q.ExecutionID, ExecutionQueued); err != nil {
+		_ = tx.Rollback()
+		return q, err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE executions SET status=? WHERE id=?`, ExecutionRunning, q.ExecutionID); err != nil {
+		_ = tx.Rollback()
+		return q, err
+	}
+	q.Attempt++
+	return q, tx.Commit()
+}
+func (s *Store) FinishQueuedExecution(ctx context.Context, executionID string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE execution_queue SET status='finished',finished_at=? WHERE execution_id=?`, now(), executionID)
+	return err
+}
+func (s *Store) ReleaseQueuedExecution(ctx context.Context, executionID string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE execution_queue SET status=?,claimed_at=NULL WHERE execution_id=? AND status=?`, ExecutionQueued, executionID, ExecutionRunning); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE executions SET status=? WHERE id=? AND status=?`, ExecutionQueued, executionID, ExecutionRunning); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
 func (s *Store) FinishExecution(ctx context.Context, id, status, msg string) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE executions SET status=?, error=?, ended_at=? WHERE id=?`, status, msg, now(), id)
 	return err
@@ -158,6 +265,88 @@ func (s *Store) FinishExecution(ctx context.Context, id, status, msg string) err
 func (s *Store) SaveExecutionResult(ctx context.Context, id string, result any) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE executions SET result_json=? WHERE id=?`, marshal(result), id)
 	return err
+}
+func (s *Store) SetExecutionWaiting(ctx context.Context, id string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE executions SET status=?,error='',ended_at=NULL WHERE id=?`, ExecutionWaiting, id)
+	return err
+}
+func (s *Store) CreateWait(ctx context.Context, wait Wait) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO execution_waits(execution_id,ordinal,until_at,status,created_at) VALUES(?,?,?,?,?)`, wait.ExecutionID, wait.Ordinal, wait.Until.UTC().Format(time.RFC3339Nano), "waiting", now())
+	return err
+}
+func (s *Store) Wait(ctx context.Context, executionID string, ordinal int) (Wait, error) {
+	var wait Wait
+	var until string
+	err := s.db.QueryRowContext(ctx, `SELECT execution_id,ordinal,until_at,status FROM execution_waits WHERE execution_id=? AND ordinal=?`, executionID, ordinal).Scan(&wait.ExecutionID, &wait.Ordinal, &until, &wait.Status)
+	if err != nil {
+		return wait, err
+	}
+	wait.Until, err = time.Parse(time.RFC3339Nano, until)
+	return wait, err
+}
+func (s *Store) CompleteWait(ctx context.Context, executionID string, ordinal int) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE execution_waits SET status='completed',completed_at=? WHERE execution_id=? AND ordinal=?`, now(), executionID, ordinal)
+	return err
+}
+func (s *Store) DueWaitingExecutions(ctx context.Context, at time.Time) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT e.id FROM executions e JOIN execution_waits w ON w.execution_id=e.id WHERE e.status=? AND w.status='waiting' AND w.until_at<=?`, ExecutionWaiting, at.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+func (s *Store) SetWorkflowActive(ctx context.Context, workflow string, active bool) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO workflow_activation(workflow,active,updated_at) VALUES(?,?,?) ON CONFLICT(workflow) DO UPDATE SET active=excluded.active,updated_at=excluded.updated_at`, workflow, boolInt(active), now())
+	return err
+}
+func (s *Store) WorkflowActive(ctx context.Context, workflow string) (bool, error) {
+	var active int
+	err := s.db.QueryRowContext(ctx, `SELECT active FROM workflow_activation WHERE workflow=?`, workflow).Scan(&active)
+	if err == sql.ErrNoRows {
+		return true, nil
+	}
+	return active != 0, err
+}
+func (s *Store) ScheduleNextRun(ctx context.Context, workflow string) (*time.Time, error) {
+	var raw sql.NullString
+	err := s.db.QueryRowContext(ctx, `SELECT next_run_at FROM schedule_state WHERE workflow=?`, workflow).Scan(&raw)
+	if err == sql.ErrNoRows || !raw.Valid {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	v, err := time.Parse(time.RFC3339Nano, raw.String)
+	if err != nil {
+		return nil, err
+	}
+	return &v, nil
+}
+func (s *Store) SetScheduleNextRun(ctx context.Context, workflow string, next time.Time) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO schedule_state(workflow,next_run_at,updated_at) VALUES(?,?,?) ON CONFLICT(workflow) DO UPDATE SET next_run_at=excluded.next_run_at,updated_at=excluded.updated_at`, workflow, next.UTC().Format(time.RFC3339Nano), now())
+	return err
+}
+func (s *Store) ClaimScheduleRun(ctx context.Context, workflow string, scheduled time.Time) (bool, error) {
+	r, err := s.db.ExecContext(ctx, `INSERT INTO schedule_runs(workflow,scheduled_at,created_at) VALUES(?,?,?) ON CONFLICT(workflow,scheduled_at) DO NOTHING`, workflow, scheduled.UTC().Format(time.RFC3339Nano), now())
+	if err != nil {
+		return false, err
+	}
+	n, err := r.RowsAffected()
+	return n == 1, err
+}
+func (s *Store) RunningWorkflowCount(ctx context.Context, workflow string) (int, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM executions WHERE workflow=? AND status=?`, workflow, ExecutionRunning).Scan(&count)
+	return count, err
 }
 func (s *Store) BeginRecovery(ctx context.Context, executionID, version string, force bool) (int, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -255,7 +444,7 @@ func (s *Store) Execution(ctx context.Context, id string) (Execution, error) {
 	var started string
 	var ended sql.NullString
 	var input, manifest, result []byte
-	err := s.db.QueryRowContext(ctx, `SELECT id,workflow,version,status,input_json,artifact_manifest_json,result_json,recovery_count,started_at,ended_at,COALESCE(error,'') FROM executions WHERE id=?`, id).Scan(&e.ID, &e.Workflow, &e.Version, &e.Status, &input, &manifest, &result, &e.RecoveryCount, &started, &ended, &e.Error)
+	err := s.db.QueryRowContext(ctx, `SELECT id,workflow,version,status,input_json,artifact_manifest_json,COALESCE(result_json,X''),recovery_count,started_at,ended_at,COALESCE(error,'') FROM executions WHERE id=?`, id).Scan(&e.ID, &e.Workflow, &e.Version, &e.Status, &input, &manifest, &result, &e.RecoveryCount, &started, &ended, &e.Error)
 	e.Input = input
 	e.ArtifactManifest = manifest
 	e.Result = result
@@ -270,7 +459,7 @@ func (s *Store) Execution(ctx context.Context, id string) (Execution, error) {
 	return e, nil
 }
 func (s *Store) Runs(ctx context.Context, workflow string) ([]Execution, error) {
-	q := `SELECT id,workflow,version,status,input_json,artifact_manifest_json,result_json,recovery_count,started_at,ended_at,COALESCE(error,'') FROM executions`
+	q := `SELECT id,workflow,version,status,input_json,artifact_manifest_json,COALESCE(result_json,X''),recovery_count,started_at,ended_at,COALESCE(error,'') FROM executions`
 	args := []any{}
 	if workflow != "" {
 		q += ` WHERE workflow=?`

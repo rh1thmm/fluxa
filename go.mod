@@ -4,6 +4,8 @@ go 1.27
 
 require (
 	github.com/BurntSushi/toml v1.5.0
+	github.com/robfig/cron/v3 v3.0.1
+	github.com/yuin/goldmark v1.7.15
 	github.com/yuin/gopher-lua v1.1.1
 	modernc.org/sqlite v1.40.1
 )

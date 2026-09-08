@@ -51,6 +51,8 @@ type current struct {
 	replay, force, ambiguous                   bool
 	taskStack                                  []taskScope
 	nextByParent                               map[string]int
+	waitOrdinal                                int
+	waiting                                    bool
 }
 
 func New(s *store.Store) *Runner {
@@ -61,6 +63,7 @@ func id(prefix string) string {
 	_, _ = rand.Read(b)
 	return prefix + hex.EncodeToString(b)
 }
+func NewExecutionID() string { return id("exec_") }
 func digest(v []byte) string { h := sha256.Sum256(v); return hex.EncodeToString(h[:]) }
 func ArtifactFor(root, name string, w config.Workflow) (Artifact, error) {
 	entry := filepath.Join(root, w.Entry)
@@ -86,12 +89,33 @@ func Compile(entry string) error {
 }
 
 func (r *Runner) Run(ctx context.Context, root, name string, w config.Workflow, artifact Artifact, input any) (string, error) {
-	eid := id("exec_")
+	eid := NewExecutionID()
 	if err := r.Store.CreateExecution(ctx, store.Execution{ID: eid, Workflow: name, Version: artifact.Version, Status: store.ExecutionRunning}, input, artifact); err != nil {
 		return "", err
 	}
 	_ = r.Store.Event(ctx, eid, "", "", "execution.started", map[string]any{"workflow": name, "version": artifact.Version})
 	return eid, r.execute(ctx, root, name, w, artifact, eid, input, false, false, 0)
+}
+
+// RunQueued executes a ledger entry previously created by Store.EnqueueExecution.
+// A reclaimed queue item replays durable task/operation state rather than starting
+// a second execution lineage.
+func (r *Runner) RunQueued(ctx context.Context, root, name string, w config.Workflow, artifact Artifact, executionID string, attempt int) error {
+	e, err := r.Store.Execution(ctx, executionID)
+	if err != nil {
+		return err
+	}
+	if e.Version != artifact.Version {
+		return fmt.Errorf("workflow_version_mismatch: execution uses %s but current source is %s", e.Version, artifact.Version)
+	}
+	var input any
+	if len(e.Input) > 0 {
+		if err := json.Unmarshal(e.Input, &input); err != nil {
+			return fmt.Errorf("decode queued input: %w", err)
+		}
+	}
+	_ = r.Store.Event(ctx, executionID, "", "", "execution.started", map[string]any{"workflow": name, "queued": true, "attempt": attempt})
+	return r.execute(ctx, root, name, w, artifact, executionID, input, attempt > 1, false, 0)
 }
 func (r *Runner) Retry(ctx context.Context, root string, m config.Manifest, executionID string, force bool) (string, error) {
 	e, err := r.Store.Execution(ctx, executionID)
@@ -130,6 +154,41 @@ func (r *Runner) Retry(ctx context.Context, root string, m config.Manifest, exec
 	return executionID, err
 }
 
+// Resume continues a timer-paused execution by replaying its workflow chunk.
+// Completed durable operations are returned from the ledger during that replay.
+func (r *Runner) Resume(ctx context.Context, root string, m config.Manifest, executionID string) (string, error) {
+	e, err := r.Store.Execution(ctx, executionID)
+	if err != nil {
+		return "", err
+	}
+	if e.Status != store.ExecutionWaiting {
+		return "", fmt.Errorf("execution %s is not waiting (status %s)", executionID, e.Status)
+	}
+	w, ok := m.Workflows[e.Workflow]
+	if !ok {
+		return "", fmt.Errorf("original workflow %q no longer exists", e.Workflow)
+	}
+	artifact, err := ArtifactFor(root, e.Workflow, w)
+	if err != nil {
+		return "", err
+	}
+	if artifact.Version != e.Version {
+		return "", fmt.Errorf("workflow_version_mismatch: execution uses %s but current source is %s", e.Version, artifact.Version)
+	}
+	var input any
+	if len(e.Input) > 0 {
+		if err := json.Unmarshal(e.Input, &input); err != nil {
+			return "", fmt.Errorf("decode original input: %w", err)
+		}
+	}
+	attempt, err := r.Store.BeginRecovery(ctx, executionID, e.Version, false)
+	if err != nil {
+		return "", err
+	}
+	_ = r.Store.Event(ctx, executionID, "", "", "execution.resumed", map[string]any{"attempt": attempt})
+	return executionID, r.execute(ctx, root, e.Workflow, w, artifact, executionID, input, true, false, attempt)
+}
+
 func (r *Runner) execute(ctx context.Context, root, name string, w config.Workflow, artifact Artifact, eid string, input any, replay, force bool, recoveryAttempt int) error {
 	if w.Timeout != "" {
 		d, err := time.ParseDuration(w.Timeout)
@@ -150,6 +209,11 @@ func (r *Runner) execute(ctx context.Context, root, name string, w config.Workfl
 	r.bind(L, c)
 	entry := filepath.Join(root, w.Entry)
 	if err := L.DoFile(entry); err != nil {
+		if c.waiting {
+			_ = r.Store.SetExecutionWaiting(context.Background(), eid)
+			_ = r.Store.Event(context.Background(), eid, "", "", "execution.waiting", map[string]any{"ordinal": c.waitOrdinal})
+			return nil
+		}
 		return r.finish(eid, recoveryAttempt, store.ExecutionFailed, err.Error())
 	}
 	returned := L.Get(-1)
@@ -200,6 +264,23 @@ func (r *Runner) bind(L *lua.LState, c *current) {
 		L.SetField(h, m, L.NewFunction(func(L *lua.LState) int { return r.httpCall(L, c, strings.ToUpper(m)) }))
 	}
 	L.SetGlobal("http", h)
+	wait := L.NewTable()
+	waitFor := L.NewFunction(func(L *lua.LState) int {
+		return r.waitFor(L, c)
+	})
+	// "for" is reserved in Lua, so wait.sleep is the readable native syntax.
+	// The indexed spelling remains available for callers that need it.
+	L.SetField(wait, "sleep", waitFor)
+	L.SetField(wait, "for", waitFor)
+	L.SetField(wait, "until", L.NewFunction(func(L *lua.LState) int {
+		until, err := time.Parse(time.RFC3339, L.CheckString(1))
+		if err != nil {
+			L.RaiseError("wait.until expects an RFC3339 timestamp: %s", err)
+			return 0
+		}
+		return r.waitUntil(L, c, until)
+	}))
+	L.SetGlobal("wait", wait)
 	j := L.NewTable()
 	L.SetField(j, "decode", L.NewFunction(func(L *lua.LState) int {
 		var v any
@@ -227,6 +308,47 @@ func (r *Runner) bind(L *lua.LState, c *current) {
 	L.SetField(fluxa, "attempt", lua.LNumber(c.attempt))
 	L.SetField(fluxa, "input", fromGo(L, c.input))
 	L.SetGlobal("fluxa", fluxa)
+}
+
+func (r *Runner) waitFor(L *lua.LState, c *current) int {
+	duration, err := time.ParseDuration(L.CheckString(1))
+	if err != nil || duration <= 0 {
+		L.RaiseError("wait.sleep expects a positive duration")
+		return 0
+	}
+	return r.waitUntil(L, c, time.Now().UTC().Add(duration))
+}
+
+func (r *Runner) waitUntil(L *lua.LState, c *current, until time.Time) int {
+	c.waitOrdinal++
+	wait, err := c.store.Wait(c.ctx, c.executionID, c.waitOrdinal)
+	if err == sql.ErrNoRows {
+		wait = store.Wait{ExecutionID: c.executionID, Ordinal: c.waitOrdinal, Until: until.UTC()}
+		if err := c.store.CreateWait(c.ctx, wait); err != nil {
+			L.RaiseError("persist wait: %s", err)
+			return 0
+		}
+		c.waiting = true
+		L.RaiseError("fluxa execution waiting")
+		return 0
+	}
+	if err != nil {
+		L.RaiseError("load wait: %s", err)
+		return 0
+	}
+	if wait.Status == "completed" {
+		return 0
+	}
+	if time.Now().UTC().Before(wait.Until) {
+		c.waiting = true
+		L.RaiseError("fluxa execution waiting")
+		return 0
+	}
+	if err := c.store.CompleteWait(c.ctx, c.executionID, c.waitOrdinal); err != nil {
+		L.RaiseError("complete wait: %s", err)
+		return 0
+	}
+	return 0
 }
 
 const taskBuilderType = "fluxa.task_builder"

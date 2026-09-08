@@ -15,9 +15,14 @@ manifest validation, foreground execution, explicit Lua tasks, HTTP, JSON,
 durable run/task/operation records, timeline inspection, and conservative
 execution replay.
 
-Scheduling/daemon deployment, parallel collections, and credential backends are
-intentionally not yet available. HTTP writes whose outcome cannot be confirmed
-are recorded as `ambiguous` and stop the execution until an explicit forced retry.
+The local daemon supports cron schedules, inbound webhooks, activation state,
+replay-based timer waits, and a SQLite-backed local queue. Schedule and webhook
+triggers create a durable execution before returning or dispatching work; a
+restarted daemon reclaims unfinished queue entries under the same execution ID.
+Parallel collections, credential backends, service installation, and remote
+deployment are intentionally not yet available. HTTP writes whose outcome
+cannot be confirmed are recorded as `ambiguous` and stop the execution until an
+explicit forced retry.
 
 ## Install
 
@@ -52,7 +57,13 @@ fluxa run example
 fluxa runs
 fluxa inspect <execution-id>
 fluxa retry <execution-id>
+fluxa docs durability
+fluxa docs host
 ```
+
+`fluxa docs <query>` searches the reference bundled into the binary. `fluxa
+docs host` serves dependency-free documentation locally on `:8081`; it exposes
+browser views at `/docs/lua` and raw Markdown at `/docs/lua.md`.
 
 ## Workflow format
 
@@ -66,6 +77,14 @@ default_timezone = "UTC"
 [workflows.example]
 entry = "workflows/example.lua"
 timeout = "30s"
+
+[workflows.example.schedule]
+cron = "0 9 * * 1-5"
+timezone = "America/Edmonton"
+
+[workflows.example.webhook]
+method = "POST"
+path = "/example"
 ```
 
 The Lua file itself is the workflow. Its top-level return value is the workflow
@@ -88,7 +107,9 @@ log.info("loaded leads", { count = #leads })
 return { processed = #leads }
 ```
 
-Available v0.1 globals are `task`, `http`, `json`, `log`, `env`, and `fluxa`.
+Available v0.1 globals are `task`, `http`, `json`, `log`, `env`, `fluxa`, and
+`wait`. `wait.sleep("10m")` persists a timer and stops the workflow without
+keeping its Lua VM alive; a daemon resumes it by replay.
 `fluxa.execution_id`, `fluxa.workflow`, `fluxa.input`, and `fluxa.attempt` are
 available when needed. HTTP may be called only inside `task`.
 
@@ -98,7 +119,11 @@ available when needed. HTTP may be called only inside `task`.
 fluxa init <directory>
 fluxa validate [workflow]
 fluxa workflows
-fluxa run <workflow>
+fluxa run <workflow> [--input JSON]
+fluxa daemon [--listen ADDR]
+fluxa activate <workflow>
+fluxa deactivate <workflow>
+fluxa schedules
 fluxa runs [workflow]
 fluxa inspect <execution-id>
 fluxa retry <execution-id> [--force]

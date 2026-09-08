@@ -35,10 +35,39 @@ CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, execution_id TEXT NOT
 	if err := s.db.QueryRowContext(context.Background(), `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 3 {
-		t.Fatalf("schema version = %d, want 3", version)
+	if version != 6 {
+		t.Fatalf("schema version = %d, want 6", version)
 	}
 	if _, err := s.db.Exec(`INSERT INTO executions(id,workflow,version,status,input_json,artifact_manifest_json,recovery_count,started_at) VALUES('e','w','v','failed','{}','{}',0,'2026-01-01T00:00:00Z')`); err != nil {
 		t.Fatalf("new schema unavailable: %v", err)
+	}
+}
+
+func TestQueueRecoveryReclaimsSameExecution(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	if err := s.EnqueueExecution(ctx, Execution{ID: "exec_queue", Workflow: "example", Version: "v1"}, map[string]any{"trigger": "webhook"}, map[string]any{"version": "v1"}); err != nil {
+		t.Fatal(err)
+	}
+	first, err := s.ClaimQueuedExecution(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ExecutionID != "exec_queue" || first.Attempt != 1 {
+		t.Fatalf("first claim = %#v", first)
+	}
+	if err := s.RecoverQueue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	second, err := s.ClaimQueuedExecution(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.ExecutionID != "exec_queue" || second.Attempt != 2 {
+		t.Fatalf("reclaimed = %#v", second)
 	}
 }
